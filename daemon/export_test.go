@@ -28,6 +28,7 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/signtool"
 	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/client/clientutil"
@@ -541,4 +542,20 @@ func ResetBuildIDDetection() {
 
 func MockDevicestateReprovision(f func(st *state.State) (*state.Change, error)) (restore func()) {
 	return testutil.Mock(&devicestateReprovision, f)
+}
+
+// --- mediated assertion signing (api_sign.go) ---
+
+const (
+	// PolkitActionSign is the polkit action required by the sign endpoint for
+	// non-root callers.
+	PolkitActionSign = polkitActionSign
+)
+
+// MockSignKeypairManager overrides the keypair manager used by the sign and
+// keys endpoints.
+func MockSignKeypairManager(new func() (signtool.KeypairManager, error)) (restore func()) {
+	old := signKeypairManager
+	signKeypairManager = new
+	return func() { signKeypairManager = old }
 }
