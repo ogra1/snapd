@@ -16,7 +16,8 @@ details: |
     without a polkit prompt once the interface gate passes (the polkit
     auth_admin requirement is for unprivileged callers; see
     daemon/access.go). The signing key is provisioned into root's GPG
-    keyring with `snap create-key` and read by the daemon, which is why this
+    keyring as a passphrase-less key (headless CI has no pinentry) and
+    read by the daemon, which is why this
     task is restricted to systems where snapd runs as a classic (deb) package
     with a gpg binary on its PATH. On a snap-based snapd (e.g. Ubuntu Core)
     the daemon is strict-confinement with no gpg; there the endpoint must use
@@ -67,8 +68,26 @@ debug: |
     snap keys || true
 
 execute: |
-    echo "Provision a signing key into root's keyring (the daemon's keyring)"
-    expect -f create-key.exp
+    echo "Provision a passphrase-less signing key into root's keyring (the daemon's keyring)"
+    # A passphrase-LESS key is required for headless CI: there is no pinentry
+    # to unlock a passphrase-protected key, so gpg-agent would time out on
+    # every signature. (The K3 external key manager is the recommended
+    # production path; this passphrase-less GPG key is the classic/deb
+    # transitional path this task exercises.) The daemon reads the keyring
+    # directly, so no `snap create-key` (which forces a passphrase) is needed.
+    keyring=/root/.snap/gnupg
+    mkdir -p -m 700 "$keyring"
+    gpgconf --kill all --homedir "$keyring" || true
+    # idempotent: drop any pre-existing key whose uid is exactly "default"
+    # (gpg lists the fpr line before the uid line)
+    for fpr in $(gpg --homedir "$keyring" --batch --with-colons --list-secret-keys 2>/dev/null | awk -F: '
+        $1 == "fpr" { lastfpr = $10 }
+        $1 == "uid" && $10 == "default" { print lastfpr }
+    '); do
+        gpg --homedir "$keyring" --batch --yes --delete-secret-and-public-key "$fpr" || true
+    done
+    gpg --homedir "$keyring" --batch --yes --pinentry-mode loopback \
+        --passphrase "" --quick-generate-key "default" rsa4096 sign never
     snap keys | MATCH " default "
     key=$(snap keys | grep " default " | tr -s ' ' | cut -d ' ' -f 2)
     test -n "$key"
@@ -99,7 +118,9 @@ execute: |
     MATCH "type: model" < signed.assert
     MATCH "sign-key-sha3-384: $key" < signed.assert
     # the daemon must not echo anything secret; only the signed assertion
-    test "$(grep -c openpgp signed.assert)" -ge 1
+    # modern snapd emits a base64 detached signature (no "openpgp rsa.." header);
+    # a valid signed assertion has a non-empty signature line after the header block
+    test "$(awk "NR>1 && blank==1 && NF{c++} /^$/{blank=1} END{print c+0}" signed.assert)" -ge 1
 
     echo "Denial 3: after disconnecting, the endpoint is 403 again"
     snap disconnect assertion-sign-client:assertion-sign

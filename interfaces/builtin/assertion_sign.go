@@ -51,16 +51,30 @@ type assertionSignInterface struct {
 	commonInterface
 }
 
-// BeforePreparePlug validates plug attributes at connection time so an invalid
-// allow-list fails fast (at connect) rather than at signing time.
+// BeforePreparePlug validates plug attributes at connection time so an
+// invalid allow-list fails fast (at connect) rather than at signing time.
+//
+// The "assertion-types" attribute is mandatory (resolved O4, deny-all):
+// signing is a security-critical grant, so the package maintainer must
+// declare the specific assertion types the snap may request signatures for.
+// That declaration ships alongside the allow-installation request for the
+// plug, making the requested signing scope visible to the store review and
+// to the user at connect time. A plug without the attribute is useless with
+// the handler's fail-closed semantics, so rejecting it at install/connect
+// time gives the clearest feedback.
 func (i *assertionSignInterface) BeforePreparePlug(plug *snap.PlugInfo) error {
 	types, ok := plug.Attrs["assertion-types"]
 	if !ok {
-		// Open question O4: default when the attribute is omitted. This
-		// skeleton implements "allow-all"; flip to deny-all per review.
-		return nil
+		// O4 (resolved): omitted "assertion-types" means the connection may
+		// not sign any assertion type (deny-all). Fail early and explicitly
+		// instead of leaving a plug that can never succeed.
+		return fmt.Errorf(`plug attribute "assertion-types" is required: list the assertion types (e.g. ["model"]) this snap may sign; an omitted attribute is a deny-all grant (see the assertion-sign interface docs)`)
 	}
-	for _, t := range types.([]any) {
+	list, ok := types.([]any)
+	if !ok || len(list) == 0 {
+		return fmt.Errorf(`plug attribute "assertion-types" must be a non-empty list of assertion type names, e.g. ["model"]`)
+	}
+	for _, t := range list {
 		s, ok := t.(string)
 		if !ok || asserts.Type(s) == nil {
 			return fmt.Errorf("unknown assertion type %v in plug attribute \"assertion-types\"", t)
@@ -71,10 +85,15 @@ func (i *assertionSignInterface) BeforePreparePlug(plug *snap.PlugInfo) error {
 
 func init() {
 	registerIface(&assertionSignInterface{commonInterface{
-		name:                 "assertion-sign",
-		summary:              assertionSignSummary,
-		implicitOnCore:       false,
-		implicitOnClassic:    false,
+		name:    "assertion-sign",
+		summary: assertionSignSummary,
+		// The slot is an OS-provided (implicit) slot, like ros-snapd-support
+		// and snapd-control: it must materialize on the OS snap on both core
+		// and classic systems. The *plug* is not implicit: base-declaration
+		// allow-installation: false means only snaps with an explicit
+		// allow-installation request can use it.
+		implicitOnCore:       true,
+		implicitOnClassic:    true,
 		baseDeclarationPlugs: assertionSignBaseDeclarationPlugs,
 		baseDeclarationSlots: assertionSignBaseDeclarationSlots,
 	}})

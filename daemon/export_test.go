@@ -37,6 +37,7 @@ import (
 	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/assertstate"
+	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
@@ -558,4 +559,20 @@ func MockSignKeypairManager(new func() (signtool.KeypairManager, error)) (restor
 	old := signKeypairManager
 	signKeypairManager = new
 	return func() { signKeypairManager = old }
+}
+
+// MockSignFetchAccountKey overrides the account-key store lookup used by the
+// "chain" option of POST /v2/assertions/sign.
+func MockSignFetchAccountKey(new func(c *Command, keyID string, user *auth.UserState) (*asserts.AccountKey, error)) (restore func()) {
+	old := fetchAccountKeyImpl
+	fetchAccountKeyImpl = new
+	return func() { fetchAccountKeyImpl = old }
+}
+
+// MockSignFetchAccount overrides the account store lookup used by the "chain"
+// option of POST /v2/assertions/sign.
+func MockSignFetchAccount(new func(c *Command, accountID string, user *auth.UserState) (asserts.Assertion, error)) (restore func()) {
+	old := fetchAccountImpl
+	fetchAccountImpl = new
+	return func() { fetchAccountImpl = old }
 }

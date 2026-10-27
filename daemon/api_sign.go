@@ -22,16 +22,16 @@ package daemon
 // Mediated assertion signing for restricted snaps.
 //
 // A snap that plugs the "assertion-sign" interface and runs unprivileged can
-// ask snapd to sign an assertion on its behalf. Authorization is enforced twice,
-// independently:
+// ask snapd to sign an assertion on its behalf. Authorization is enforced
+// twice, independently:
 //
 //  1. The access checker (interfaceRootAccess) requires a *connected*
 //     "assertion-sign" plug for the caller. The caller is identified from peer
 //     credentials / AppArmor security tag (never from request headers), and a
 //     non-root caller must additionally pass the io.snapcraft.snapd.sign polkit
 //     action (auth_admin). See requireInterfaceApiAccessImpl in daemon/access.go.
-//  2. The handler enforces the per-connection "assertion-types" allow-list, so a
-//     connection may only sign the assertion types it was granted.
+//  2. The handler enforces the per-connection "assertion-types" allow-list, so
+//     a connection may only sign the assertion types it was granted.
 //
 // The private key never reaches the calling snap: signing happens in the daemon
 // using a keypair manager configured on the daemon (the user's GPG keyring or an
@@ -59,6 +59,15 @@ const maxSignBody = 1 << 20 // 1 MiB
 // signtool.GetKeypairManager (GPG keyring, or SNAPD_EXT_KEYMGR when set on the
 // daemon unit). Tests override it via MockSignKeypairManager.
 var signKeypairManager = signtool.GetKeypairManager
+
+// fetchAccountKeyImpl / fetchAccountImpl perform the store lookups for the
+// "chain" option (like `snap sign --chain` does). They are variables so
+// tests can exercise the chain without a live store; the production path is
+// exactly the daemon's storeFrom(...).Assertion, the same one the CLI uses.
+var (
+	fetchAccountKeyImpl = fetchAccountKey
+	fetchAccountImpl    = fetchAccount
+)
 
 var (
 	signAssertCmd = &Command{
@@ -96,7 +105,7 @@ type signRequest struct {
 	UpdateTimestamp bool `json:"update-timestamp"`
 }
 
-func signAssert(c *Command, r *http.Request, _ *auth.UserState) Response {
+func signAssert(c *Command, r *http.Request, user *auth.UserState) Response {
 	// The caller's identity and its *connected* assertion-sign plug were already
 	// established by the access checker. We re-derive the instance name only to
 	// scope the per-connection type allow-list below.
@@ -130,15 +139,12 @@ func signAssert(c *Command, r *http.Request, _ *auth.UserState) Response {
 	if err != nil {
 		return InternalError("%v", err)
 	}
-	if !allowed.all {
-		typ, _ := req.Statement["type"].(string)
-		if !allowed.contains(typ) {
-			// Deny before any polkit prompt interaction is possible.
-			return Forbidden("assertion type %q is not allowed for this connection", typ)
-		}
+	if !allowed.contains(req.Statement) {
+		// Deny before any polkit prompt interaction is possible.
+		return Forbidden("assertion type %q is not allowed for this connection", req.Statement["type"])
 	}
 
-	// Sign.
+	// Resolve the signing key.
 	kpm, err := signKeypairManager()
 	if err != nil {
 		return InternalError("cannot open keypair manager: %v", err)
@@ -151,10 +157,25 @@ func signAssert(c *Command, r *http.Request, _ *auth.UserState) Response {
 	if err != nil {
 		return BadRequest("cannot marshal statement: %v", err)
 	}
+
+	// Look up the account-key for the key, like `snap sign` does, to
+	// cross-check the statement against the key's signing constraints.
+	// With "chain" a lookup failure is an error (the chain is unusable
+	// without it); without "chain" a missing account-key is not (the CLI
+	// only warns in that case).
+	keyID := privKey.PublicKey().ID()
+	accountKey, akErr := fetchAccountKeyImpl(c, keyID, user)
+	if req.Chain && akErr != nil {
+		return BadRequest("cannot create assertion chain: %v", akErr)
+	}
+
 	opts := &signtool.Options{
-		KeyID:           privKey.PublicKey().ID(),
+		KeyID:           keyID,
 		Statement:       stmt,
 		UpdateTimestamp: req.UpdateTimestamp,
+	}
+	if accountKey != nil {
+		opts.AccountKey = accountKey
 	}
 	encoded, err := signtool.Sign(opts, kpm)
 	if err != nil {
@@ -168,25 +189,56 @@ func signAssert(c *Command, r *http.Request, _ *auth.UserState) Response {
 		return InternalError("cannot encode signed assertion: %v", err)
 	}
 	if req.Chain {
-		if err := appendSignChain(&buf, privKey, req.Statement); err != nil {
-			return BadRequest("cannot build assertion chain: %v", err)
+		account, err := fetchAccountImpl(c, accountKey.AccountID(), user)
+		if err != nil {
+			return BadRequest("cannot create assertion chain: %v", err)
+		}
+		if err := enc.Encode(accountKey); err != nil {
+			return InternalError("cannot encode assertion chain: %v", err)
+		}
+		if err := enc.Encode(account); err != nil {
+			return InternalError("cannot encode assertion chain: %v", err)
 		}
 	}
 	return SyncResponse(buf.String())
 }
 
-// appendSignChain appends the account-key and account assertions, mirroring
-// cmd_sign.go. The skeleton reads from the system assertion database; a store
-// fetch for uncached account-key/account is a follow-on (the CLI already does
-// this over the store client).
-func appendSignChain(buf *bytes.Buffer, privKey asserts.PrivateKey, stmt map[string]any) error {
-	_ = buf
-	_ = privKey
-	_ = stmt
-	// TODO(skeleton): resolve account-key (header public-key-sha3-384 = key id)
-	// and account (header account-id = statement authority-id), then
-	// enc.Encode(accountKey) and enc.Encode(account), as cmd_sign.go does.
-	return fmt.Errorf("chain is not supported by this skeleton; use `snap sign --chain`")
+// fetchAccountKey returns the account-key assertion for the given key id,
+// mirroring the `snap sign` chain lookup (primary key public-key-sha3-384).
+func fetchAccountKey(c *Command, keyID string, user *auth.UserState) (*asserts.AccountKey, error) {
+	primaryKeys, err := asserts.PrimaryKeyFromHeaders(asserts.AccountKeyType, map[string]string{
+		"public-key-sha3-384": keyID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cannot query remote assertion: %v", err)
+	}
+	sto := storeFrom(c.d)
+	as, err := sto.Assertion(asserts.AccountKeyType, primaryKeys, user)
+	if err != nil {
+		return nil, err
+	}
+	ak, ok := as.(*asserts.AccountKey)
+	if !ok {
+		return nil, fmt.Errorf("internal error: expected account-key assertion, got %s", as.Type().Name)
+	}
+	return ak, nil
+}
+
+// fetchAccount returns the account assertion for the given account id,
+// mirroring the `snap sign` chain lookup (primary key account-id).
+func fetchAccount(c *Command, accountID string, user *auth.UserState) (asserts.Assertion, error) {
+	primaryKeys, err := asserts.PrimaryKeyFromHeaders(asserts.AccountType, map[string]string{
+		"account-id": accountID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cannot query remote assertion: %v", err)
+	}
+	sto := storeFrom(c.d)
+	as, err := sto.Assertion(asserts.AccountType, primaryKeys, user)
+	if err != nil {
+		return nil, err
+	}
+	return as, nil
 }
 
 // listKeys returns public info about the daemon's signing keys (names + key
@@ -215,21 +267,31 @@ func listKeys(_ *Command, r *http.Request, _ *auth.UserState) Response {
 }
 
 // assertionTypeSet is the per-connection assertion-type allow-list.
+//
+// It is always explicit: "all" is never set from connection state. (Resolved
+// O4, deny-all: the "assertion-types" plug attribute is mandatory and the
+// endpoint refuses to sign any type the connection was not granted. A
+// connection without the attribute — e.g. created by an older snapd before the
+// attribute became mandatory — cannot sign at all; the interface rejects such
+// plugs at install time, so reaching the endpoint with one indicates a policy
+// bug and is denied.)
 type assertionTypeSet struct {
 	all   bool
 	types map[string]bool
 }
 
-func (s assertionTypeSet) contains(typ string) bool {
+// contains reports whether the statement's assertion type is allowed by the
+// set. A missing or non-string "type" header is never allowed.
+func (s assertionTypeSet) contains(stmt map[string]any) bool {
 	if s.all {
 		return true
 	}
-	return s.types[typ]
+	typ, _ := stmt["type"].(string)
+	return typ != "" && s.types[typ]
 }
 
 // connectedPlugAssertionTypes reads the "assertion-types" attribute of the
-// caller's active assertion-sign plug. An omitted attribute means allow-all
-// (open question O4; flip to deny-all per review).
+// caller's active assertion-sign plug.
 func connectedPlugAssertionTypes(c *Command, instanceName string) (assertionTypeSet, error) {
 	st := c.d.state
 	st.Lock()
@@ -250,8 +312,9 @@ func connectedPlugAssertionTypes(c *Command, instanceName string) (assertionType
 			continue
 		}
 		types, ok := connState.StaticPlugAttrs["assertion-types"].([]any)
-		if !ok {
-			return assertionTypeSet{all: true}, nil
+		if !ok || len(types) == 0 {
+			// O4 (resolved): omitted or empty "assertion-types" is deny-all.
+			return assertionTypeSet{types: map[string]bool{}}, nil
 		}
 		set := make(map[string]bool, len(types))
 		for _, t := range types {
@@ -262,5 +325,5 @@ func connectedPlugAssertionTypes(c *Command, instanceName string) (assertionType
 	}
 	// No active assertion-sign connection for this instance. The access checker
 	// already rejects this path; reaching here indicates a policy bug.
-	return assertionTypeSet{all: false}, fmt.Errorf("no active assertion-sign connection for %q", instanceName)
+	return assertionTypeSet{}, fmt.Errorf("no active assertion-sign connection for %q", instanceName)
 }

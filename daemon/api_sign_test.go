@@ -30,8 +30,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 
 	. "gopkg.in/check.v1"
 
@@ -50,6 +52,54 @@ type signAPIsSuite struct {
 }
 
 var _ = Suite(&signAPIsSuite{})
+
+func (s *signAPIsSuite) SetUpTest(c *C) {
+	s.apiBaseSuite.SetUpTest(c)
+	// The unit test environment has no store. Default both "chain" store
+	// fetches to NotFound so every sign request behaves like the CLI's
+	// "could not fetch account-key" warning path unless a test overrides
+	// them with MockSignFetchAccountKey/MockSignFetchAccount.
+	s.AddCleanup(daemon.MockSignFetchAccountKey(mockSignAccountKeyNotFound()))
+	s.AddCleanup(daemon.MockSignFetchAccount(mockSignNotFound("account")))
+}
+
+// mockSignNotFound emulates the daemon store reporting that the assertion
+// does not exist (what happens for a bare fake key in the unit test
+// environment); the handler must treat a missing account-key as "no
+// cross-check" (like the CLI), and a missing account as a chain failure.
+func mockSignNotFound(kind string) func(c *daemon.Command, keyOrAccountID string, user *auth.UserState) (asserts.Assertion, error) {
+	return func(c *daemon.Command, keyOrAccountID string, user *auth.UserState) (asserts.Assertion, error) {
+		return nil, &asserts.NotFoundError{
+			Type:    kindType(kind),
+			Headers: map[string]string{kindHeader(kind): keyOrAccountID},
+		}
+	}
+}
+
+// mockSignAccountKeyNotFound is the account-key-typed counterpart of
+// mockSignNotFound (the two store fetches return different types).
+func mockSignAccountKeyNotFound() func(c *daemon.Command, keyID string, user *auth.UserState) (*asserts.AccountKey, error) {
+	return func(c *daemon.Command, keyID string, user *auth.UserState) (*asserts.AccountKey, error) {
+		return nil, &asserts.NotFoundError{
+			Type:    asserts.AccountKeyType,
+			Headers: map[string]string{"public-key-sha3-384": keyID},
+		}
+	}
+}
+
+func kindType(kind string) *asserts.AssertionType {
+	if kind == "account" {
+		return asserts.AccountType
+	}
+	return asserts.AccountKeyType
+}
+
+func kindHeader(kind string) string {
+	if kind == "account" {
+		return "account-id"
+	}
+	return "public-key-sha3-384"
+}
 
 // fakeSignKeyMgr is a minimal signtool.KeypairManager over a name->key map.
 type fakeSignKeyMgr struct {
@@ -284,7 +334,7 @@ func (s *signAPIsSuite) TestSignAssertLoggedInUserStillNeedsPolkit(c *C) {
 
 func (s *signAPIsSuite) TestSignAssertHappy(c *C) {
 	s.daemon(c)
-	s.seedConn(c)
+	s.seedConn(c, "model") // resolved O4: explicit allow-list required
 	s.expectWriteAccess(s.signAccess())
 
 	key, _ := assertstest.GenerateKey(752)
@@ -334,7 +384,7 @@ func (s *signAPIsSuite) TestSignAssertTypeNotAllowed(c *C) {
 
 func (s *signAPIsSuite) TestSignAssertMissingKey(c *C) {
 	s.daemon(c)
-	s.seedConn(c)
+	s.seedConn(c, "model")
 	s.expectWriteAccess(s.signAccess())
 
 	s.AddCleanup(daemon.MockSignKeypairManager(func() (signtool.KeypairManager, error) {
@@ -354,7 +404,7 @@ func (s *signAPIsSuite) TestSignAssertMissingKey(c *C) {
 
 func (s *signAPIsSuite) TestSignAssertMissingStatement(c *C) {
 	s.daemon(c)
-	s.seedConn(c)
+	s.seedConn(c, "model")
 	s.expectWriteAccess(s.signAccess())
 
 	req := s.signReq(c, map[string]any{"key": "default"})
@@ -410,4 +460,211 @@ func (s *signAPIsSuite) TestListKeys(c *C) {
 	daemon.AddUcrednetToRequest(req, signUcred(0))
 	rsp := s.syncReq(c, req, nil, false)
 	c.Assert(rsp.Result, NotNil)
+}
+
+// --- handler: O4 deny-all + assertion chain --------------------------------
+
+func (s *signAPIsSuite) TestSignAssertOmittedTypesDenyAll(c *C) {
+	// Resolved O4: a connection without the "assertion-types" attribute may
+	// not sign anything (deny-all), even though the interface gate passed.
+	// (Such plugs are also rejected at install time by the interface's
+	// BeforePreparePlug; this pins the handler's fail-closed behaviour.)
+	s.daemon(c)
+	s.seedConn(c) // no types
+	s.expectWriteAccess(s.signAccess())
+
+	key, _ := assertstest.GenerateKey(752)
+	s.AddCleanup(daemon.MockSignKeypairManager(func() (signtool.KeypairManager, error) {
+		return newFakeSignKeyMgr(c, "default", key), nil
+	}))
+
+	req := s.signReq(c, map[string]any{
+		"key":       "default",
+		"statement": modelStatement(),
+	})
+	daemon.AddUcrednetToRequest(req, signUcred(0))
+
+	rspe := s.errorReq(c, req, nil, false)
+	c.Check(rspe.Status, Equals, 403)
+	c.Check(rspe.Message, Matches, `assertion type "model" is not allowed for this connection.*`)
+}
+
+// fakeAccountKey builds an account-key assertion for the given key and
+// account, mirroring the fixture in asserts/signtool/sign_test.go.
+func fakeSignAccountKey(pubKey asserts.PublicKey, accountID string) *asserts.AccountKey {
+	encPubKey, err := asserts.EncodePublicKey(pubKey)
+	if err != nil {
+		panic(err)
+	}
+	return assertstest.FakeAssertionWithBody(encPubKey,
+		map[string]any{
+			"type":                "account-key",
+			"authority-id":        "can0nical",
+			"public-key-sha3-384": pubKey.ID(),
+			"account-id":          accountID,
+			"since":               "2015-11-01T20:00:00Z",
+			"body-length":         strconv.Itoa(len(encPubKey)),
+			"constraints": []any{
+				map[string]any{
+					"headers": map[string]any{
+						"type":  "model",
+						"model": `baz-.*`,
+					},
+				},
+			},
+		},
+	).(*asserts.AccountKey)
+}
+
+// signChainAssertions builds *real* signed account + account-key assertions
+// (public key = the signing key, account-id = the statement authority). They
+// must be genuinely signed: the happy chain response re-encodes both, which
+// requires their signature bytes.
+func (s *signAPIsSuite) signChainAssertions(c *C, key asserts.PrivateKey, accountID string) (*asserts.AccountKey, *asserts.Account) {
+	acc := assertstest.NewAccount(s.StoreSigning, accountID, map[string]any{
+		"account-id": accountID,
+	}, "")
+	c.Check(acc.AccountID(), Equals, accountID)
+	accKey := assertstest.NewAccountKey(s.StoreSigning, acc, nil, key.PublicKey(), "")
+	return accKey, acc
+}
+
+func (s *signAPIsSuite) TestSignAssertChain(c *C) {
+	s.daemon(c)
+	s.seedConn(c, "model")
+	s.expectWriteAccess(s.signAccess())
+
+	key, _ := assertstest.GenerateKey(752)
+	s.AddCleanup(daemon.MockSignKeypairManager(func() (signtool.KeypairManager, error) {
+		return newFakeSignKeyMgr(c, "default", key), nil
+	}))
+
+	// store lookups for the chain (mocked at the daemon fetch layer, the
+	// same way the key manager is mocked)
+	accKey, acc := s.signChainAssertions(c, key, "can0nical")
+	s.AddCleanup(daemon.MockSignFetchAccountKey(func(cmd *daemon.Command, keyID string, user *auth.UserState) (*asserts.AccountKey, error) {
+		c.Check(keyID, Equals, key.PublicKey().ID())
+		return accKey, nil
+	}))
+	s.AddCleanup(daemon.MockSignFetchAccount(func(cmd *daemon.Command, accountID string, user *auth.UserState) (asserts.Assertion, error) {
+		c.Check(accountID, Equals, "can0nical")
+		return acc, nil
+	}))
+
+	req := s.signReq(c, map[string]any{
+		"key":       "default",
+		"statement": modelStatement(),
+		"chain":     true,
+	})
+	daemon.AddUcrednetToRequest(req, signUcred(0))
+
+	rsp := s.syncReq(c, req, nil, false)
+	text, ok := rsp.Result.(string)
+	c.Assert(ok, Equals, true, Commentf("result must be the signed assertion chain: %#v", rsp.Result))
+
+	// The response is a stream: signed assertion, then account-key, then account.
+	dec := asserts.NewDecoder(bytes.NewReader([]byte(text)))
+	a, err := dec.Decode()
+	c.Assert(err, IsNil)
+	c.Check(a.Type(), Equals, asserts.ModelType)
+	c.Check(a.SignKeyID(), Equals, key.PublicKey().ID())
+
+	a2, err := dec.Decode()
+	c.Assert(err, IsNil)
+	c.Check(a2.Type(), Equals, asserts.AccountKeyType)
+	c.Check(a2.(*asserts.AccountKey).PublicKeyID(), Equals, key.PublicKey().ID())
+
+	a3, err := dec.Decode()
+	c.Assert(err, IsNil)
+	c.Check(a3.Type(), Equals, asserts.AccountType)
+
+	_, err = dec.Decode()
+	c.Check(err, Equals, io.EOF)
+}
+
+func (s *signAPIsSuite) TestSignAssertChainConstraintsViolated(c *C) {
+	// The account-key for the signing key only allows "model" assertions with
+	// model matching baz-.*; a snap-declaration statement must be rejected
+	// before any signature is produced (same cross-check as `snap sign`).
+	s.daemon(c)
+	s.seedConn(c, "model", "snap-declaration")
+	s.expectWriteAccess(s.signAccess())
+
+	key, _ := assertstest.GenerateKey(752)
+	s.AddCleanup(daemon.MockSignKeypairManager(func() (signtool.KeypairManager, error) {
+		return newFakeSignKeyMgr(c, "default", key), nil
+	}))
+
+	accKey := fakeSignAccountKey(key.PublicKey(), "can0nical")
+	s.AddCleanup(daemon.MockSignFetchAccountKey(func(cmd *daemon.Command, keyID string, user *auth.UserState) (*asserts.AccountKey, error) {
+		return accKey, nil
+	}))
+
+	stmt := modelStatement()
+	stmt["type"] = "snap-declaration"
+	req := s.signReq(c, map[string]any{
+		"key":       "default",
+		"statement": stmt,
+		"chain":     true,
+	})
+	daemon.AddUcrednetToRequest(req, signUcred(0))
+
+	rspe := s.errorReq(c, req, nil, false)
+	c.Check(rspe.Status, Equals, 400)
+	c.Check(rspe.Message, Matches, `cannot sign assertion:.*the assertion headers do not match the constraints of the signing account-key.*`)
+}
+
+func (s *signAPIsSuite) TestSignAssertNoChainMissingAccountKey(c *C) {
+	// Without "chain" a missing account-key does not block signing (the CLI
+	// only warns).
+	s.daemon(c)
+	s.seedConn(c, "model")
+	s.expectWriteAccess(s.signAccess())
+
+	key, _ := assertstest.GenerateKey(752)
+	s.AddCleanup(daemon.MockSignKeypairManager(func() (signtool.KeypairManager, error) {
+		return newFakeSignKeyMgr(c, "default", key), nil
+	}))
+	// no account-key in the (mocked) store: signing must still succeed,
+	// the cross-check is simply skipped
+	s.AddCleanup(daemon.MockSignFetchAccountKey(mockSignAccountKeyNotFound()))
+
+	req := s.signReq(c, map[string]any{
+		"key":       "default",
+		"statement": modelStatement(),
+	})
+	daemon.AddUcrednetToRequest(req, signUcred(0))
+
+	rsp := s.syncReq(c, req, nil, false)
+	c.Assert(rsp.Result, NotNil)
+}
+
+func (s *signAPIsSuite) TestSignAssertChainMissingAccount(c *C) {
+	// "chain" must fail with a clear error when the account assertion is not
+	// available (like `snap sign --chain` does).
+	s.daemon(c)
+	s.seedConn(c, "model")
+	s.expectWriteAccess(s.signAccess())
+
+	key, _ := assertstest.GenerateKey(752)
+	s.AddCleanup(daemon.MockSignKeypairManager(func() (signtool.KeypairManager, error) {
+		return newFakeSignKeyMgr(c, "default", key), nil
+	}))
+
+	accKey, _ := s.signChainAssertions(c, key, "can0nical")
+	s.AddCleanup(daemon.MockSignFetchAccountKey(func(cmd *daemon.Command, keyID string, user *auth.UserState) (*asserts.AccountKey, error) {
+		return accKey, nil
+	}))
+	s.AddCleanup(daemon.MockSignFetchAccount(mockSignNotFound("account")))
+
+	req := s.signReq(c, map[string]any{
+		"key":       "default",
+		"statement": modelStatement(),
+		"chain":     true,
+	})
+	daemon.AddUcrednetToRequest(req, signUcred(0))
+
+	rspe := s.errorReq(c, req, nil, false)
+	c.Check(rspe.Status, Equals, 400)
+	c.Check(rspe.Message, Matches, `cannot create assertion chain:.*account \(can0nical\) not found.*`)
 }
